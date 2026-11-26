@@ -20,6 +20,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,7 +30,7 @@ from telemetry import (
   interval_metrics, read_text, utc_now,
 )
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 SIZES = {
   "": 1, "B": 1, "K": 1024, "M": MIB, "G": 1024**3, "KiB": 1024,
   "MiB": MIB, "GiB": 1024**3, "kB": 1000, "MB": 1000**2, "GB": 1000**3,
@@ -81,7 +82,7 @@ def argument_parser() -> argparse.ArgumentParser:
   cli = argparse.ArgumentParser(
     description=__doc__,
     epilog="Run as your normal Linux user. "
-    "--plan-only generates the CSV schedule without launching dd.",
+    "--plan-only generates the CSV schedule without running write trials.",
   )
   location = cli.add_mutually_exclusive_group()
   location.add_argument(
@@ -360,7 +361,36 @@ def stop_dd(process: subprocess.Popen) -> None:
     process.wait()
 
 
-def run_dd(argv: list[str], config: dict, monitor: Monitor, log: Path) -> dict:
+class StopRequest:
+  """Interrupt blocking waits and let trial logging finish after a signal."""
+
+  def __init__(self):
+    self.requested = False
+    self._waiting = False
+
+  def handle_signal(self, _signum, _frame) -> None:
+    self.requested = True
+    if self._waiting:
+      raise KeyboardInterrupt
+
+  def wait(self, operation: Callable, *args) -> bool:
+    # Keep the normal blocking wait so polling cannot inflate short dd timings.
+    try:
+      self._waiting = True
+      if self.requested:
+        return False
+      operation(*args)
+      return True
+    except KeyboardInterrupt:
+      self.requested = True
+      return False
+    finally:
+      self._waiting = False
+
+
+def run_dd(
+  argv: list[str], config: dict, monitor: Monitor, log: Path, stop: StopRequest,
+) -> dict:
   """Time dd including its exit and final flush, with a separate sampler."""
   samples = []
   stopped = threading.Event()
@@ -380,10 +410,9 @@ def run_dd(argv: list[str], config: dict, monitor: Monitor, log: Path) -> dict:
     )
     try:
       watcher.start()
-      process.wait()
-    except KeyboardInterrupt:
-      interrupted = True
-      stop_dd(process)
+      if not stop.wait(process.wait):
+        interrupted = True
+        stop_dd(process)
     finally:
       ended = time.monotonic()
       ended_utc = utc_now()
@@ -421,9 +450,8 @@ def run_dd(argv: list[str], config: dict, monitor: Monitor, log: Path) -> dict:
 
 def run_trial(
   config: dict, block_size: str, target: Target, prefix: list[str], log: Path,
-  prior: dict | None,
+  prior: dict | None, stop: StopRequest,
 ) -> tuple[dict, list[dict], list[dict], float | None]:
-  result = {}
   fs = os.statvfs(target.directory)
   if fs.f_bavail * fs.f_frsize < config["bytes_requested"]:
     return {
@@ -441,27 +469,38 @@ def run_trial(
       "conv=fsync,excl", "status=progress",
     ]
     start_baseline = target.monitor.sample()
-    time.sleep(config["baseline_seconds"])
+    stop.wait(time.sleep, config["baseline_seconds"])
     end_baseline = target.monitor.sample()
-    dd = run_dd(argv, config, target.monitor, log)
+    baseline = interval_metrics(start_baseline, end_baseline)
+    result = {
+      "baseline_window_seconds": baseline["interval_seconds"],
+      **{f"pre_{key}": baseline.get(key) for key in METRICS},
+      "device_payload_mib_before": prior["payload_bytes"] / MIB if prior else 0,
+    }
+    if prior:
+      result["previous_device_block_size"] = prior["block_size"]
+    samples = [{
+      **baseline, "phase": "pre", "sample_index": 1,
+      "elapsed_trial_seconds": None, "observed_utc": end_baseline.utc,
+    }]
+    if stop.requested:
+      result.update(status="interrupted", error="interrupted before dd launch")
+      return result, samples, [], None
+    dd = run_dd(argv, config, target.monitor, log, stop)
     post = target.monitor.sample()
 
   result.update(dd["result"])
   result.update(dd_argv_json=json.dumps(argv), dd_stderr_path=f"dd/{log.name}")
-  result["device_payload_mib_before"] = 0
   if prior:
-    result["device_payload_mib_before"] = prior["payload_bytes"] / MIB
-    result["previous_device_block_size"] = prior["block_size"]
     result["seconds_since_previous_device_trial"] = (
       dd["started"] - prior["ended"]
     )
 
-  previous = start_baseline
-  samples = []
-  phased = [("pre", end_baseline)]
-  phased.extend(("during", sample) for sample in dd["during"])
+  samples[0]["elapsed_trial_seconds"] = end_baseline.time - dd["started"]
+  previous = end_baseline
+  phased = [("during", sample) for sample in dd["during"]]
   phased.append(("post", post))
-  for index, (phase, observation) in enumerate(phased, 1):
+  for index, (phase, observation) in enumerate(phased, 2):
     metrics = interval_metrics(previous, observation)
     samples.append({
       **metrics, "phase": phase, "sample_index": index,
@@ -470,8 +509,6 @@ def run_trial(
     })
     previous = observation
 
-  result["baseline_window_seconds"] = samples[0]["interval_seconds"]
-  result.update({f"pre_{key}": samples[0].get(key) for key in METRICS})
   for sensor in ("cpu", "ssd"):
     field = f"{sensor}_temp_c"
     observed = [row[field] for row in samples[1:] if row.get(field) is not None]
@@ -490,7 +527,7 @@ def cpu_model() -> str | None:
 
 def write_trials(
   output: Path, config: dict, plan: list[dict], roster: dict, prefix: list[str],
-  metadata: dict, plan_only: bool,
+  metadata: dict, plan_only: bool, stop: StopRequest,
 ) -> int:
   states = {}
   status = 0
@@ -517,7 +554,9 @@ def write_trials(
       before_sleep = time.monotonic()
       if requested:
         print(f"Cooling down for {requested:g} s", flush=True)
-        time.sleep(requested)
+        stop.wait(time.sleep, requested)
+      if stop.requested:
+        return 130
       actual = time.monotonic() - before_sleep if requested else 0
       print(f"[{order}/{len(plan)}] {subject}  bs={block_size}", flush=True)
 
@@ -528,7 +567,7 @@ def write_trials(
       try:
         result, samples, progress, end_clock = run_trial(
           config, block_size, target, prefix,
-          output / "dd" / f"{trial_id}.stderr.log", prior,
+          output / "dd" / f"{trial_id}.stderr.log", prior, stop,
         )
       except OSError as exc:
         result = {"status": "failed", "error": str(exc)}
@@ -568,16 +607,14 @@ def write_trials(
   return status
 
 
-def on_terminate(_signum, _frame) -> None:
-  raise KeyboardInterrupt
-
-
 def main() -> int:
   cli = argument_parser()
   args = cli.parse_args()
   if platform.system() != "Linux":
     cli.error("this benchmark requires Linux")
-  signal.signal(signal.SIGTERM, on_terminate)
+  stop = StopRequest()
+  signal.signal(signal.SIGTERM, stop.handle_signal)
+  signal.signal(signal.SIGINT, stop.handle_signal)
   try:
     config = load_config(args)
     roster = make_subjects(args, config)
@@ -623,15 +660,14 @@ def main() -> int:
   status = 1
   try:
     status = write_trials(
-      output, config, plan, roster, prefix, metadata, args.plan_only,
+      output, config, plan, roster, prefix, metadata, args.plan_only, stop,
     )
-  except KeyboardInterrupt:
-    status = 130
+    if stop.requested:
+      status = 130
   finally:
     metadata["finished_utc"] = utc_now()
-    if not args.plan_only:
-      outcomes = {0: "complete", 130: "interrupted"}
-      metadata["status"] = outcomes.get(status, "failed")
+    success = "plan_only" if args.plan_only else "complete"
+    metadata["status"] = {0: success, 130: "interrupted"}.get(status, "failed")
     write_json(output / "run.json", metadata)
   return status
 

@@ -60,6 +60,17 @@ def read_int(path: Path) -> int | None:
   return int(value) if value is not None and value.isdecimal() else None
 
 
+def all_backing_disks(nodes: list[Path]) -> set[str]:
+  """A partially traceable storage stack cannot identify its physical disks."""
+  disks = set()
+  for node in nodes:
+    parents = backing_disks(node)
+    if not parents:
+      return set()
+    disks.update(parents)
+  return disks
+
+
 def backing_disks(node: Path) -> set[str]:
   """Walk from a kernel block device to the disks beneath it."""
   if not node.exists():
@@ -69,10 +80,57 @@ def backing_disks(node: Path) -> set[str]:
     return backing_disks(node.parent)
   slaves = list((node / "slaves").glob("*"))
   if slaves:
-    return set().union(*(backing_disks(slave) for slave in slaves))
+    return all_backing_disks(slaves)
   if re.fullmatch(r"(dm-|md|loop|ram|zram)\d+", node.name):
     return set()
   return {node.name}
+
+
+def source_device_number(source: str | None) -> str | None:
+  source = (source or "").split("[", 1)[0]
+  if not source.startswith("/dev/"):
+    return None
+  try:
+    info = Path(source).stat()
+  except OSError:
+    return None
+  if stat.S_ISBLK(info.st_mode):
+    return f"{os.major(info.st_rdev)}:{os.minor(info.st_rdev)}"
+  return None
+
+
+def btrfs_backing_disks(mount: dict) -> set[str]:
+  root = SYS / "fs/btrfs"
+  pair = source_device_number(mount["source"])
+  if pair is None and (SYS / "dev/block" / mount["maj:min"]).exists():
+    pair = mount["maj:min"]
+  if pair:
+    # SOURCE identifies one member. Locate its mounted filesystem before
+    # attributing any counters; cloned volumes may share an on-disk UUID.
+    filesystems = {
+      member.parent.parent for member in root.glob("*/devices/*")
+      if read_text(member / "dev") == pair
+    }
+    if len(filesystems) != 1:
+      return set()
+    filesystem = filesystems.pop()
+  elif mount.get("uuid"):
+    filesystem = root / mount["uuid"]
+  else:
+    return set()
+
+  # devices/ has links for present block devices only. devinfo/ also lists
+  # missing members on degraded mounts (Linux 5.6 and later).
+  try:
+    members = list((filesystem / "devices").iterdir())
+    device_info = list((filesystem / "devinfo").iterdir())
+  except OSError:
+    return set()
+  if len(device_info) != len(members) or any(
+    read_int(info / "missing") != 0 for info in device_info
+  ):
+    return set()
+  return all_backing_disks(members)
 
 
 def inspect_mount(directory: Path, disk_override: str | None) -> dict:
@@ -80,24 +138,18 @@ def inspect_mount(directory: Path, disk_override: str | None) -> dict:
   result = subprocess.run(
     [
       "findmnt", "--json", "--target", str(directory),
-      "--output", "TARGET,SOURCE,FSTYPE,MAJ:MIN,OPTIONS",
+      "--output", "TARGET,SOURCE,FSTYPE,MAJ:MIN,OPTIONS,UUID",
     ],
     capture_output=True,
     text=True,
     check=True,
   )
   mount = json.loads(result.stdout)["filesystems"][0]
-  source = (mount["source"] or "").split("[", 1)[0]
-  devices = backing_disks(SYS / "dev/block" / mount["maj:min"])
-
-  # Some filesystems expose an anonymous mount device, including Btrfs.
-  if not devices and source.startswith("/dev/"):
-    try:
-      info = Path(source).stat()
-    except OSError:
-      info = None
-    if info is not None and stat.S_ISBLK(info.st_mode):
-      pair = f"{os.major(info.st_rdev)}:{os.minor(info.st_rdev)}"
+  if mount["fstype"] == "btrfs":
+    devices = btrfs_backing_disks(mount)
+  else:
+    devices = backing_disks(SYS / "dev/block" / mount["maj:min"])
+    if not devices and (pair := source_device_number(mount["source"])):
       devices = backing_disks(SYS / "dev/block" / pair)
 
   disk = next(iter(devices)) if len(devices) == 1 else None

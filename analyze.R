@@ -130,7 +130,8 @@ prepare_units <- function(plan, trials, covariates) {
     }
     unit
   })
-  units <- do.call(rbind, rows)
+  # Subject IDs are data. A name such as "deparse.level" is an rbind argument.
+  units = do.call(rbind, unname(rows))
   units$geomean_mib_s <- exp(units$mean_log_mib_s)
   rownames(units) <- NULL
   units
