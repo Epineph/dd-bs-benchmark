@@ -1,0 +1,5 @@
+subject_id,block_id,directory
+drive-a,pair-01,/mnt/drive-a/benchmark
+drive-b,pair-01,/mnt/drive-b/benchmark
+drive-c,pair-02,/mnt/drive-c/benchmark
+drive-d,pair-02,/mnt/drive-d/benchmark

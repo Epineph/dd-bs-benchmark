@@ -1,0 +1,17 @@
+{
+  "block_sizes": [
+    "256K",
+    "1M",
+    "4M",
+    "16M",
+    "64M"
+  ],
+  "bytes_per_trial": "8GiB",
+  "trials_per_condition": 1,
+  "trials_per_subject": 1,
+  "cooldown_seconds": 60,
+  "baseline_seconds": 1,
+  "sample_interval_seconds": 1,
+  "seed": null,
+  "io_priority": 0
+}
